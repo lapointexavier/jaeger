@@ -1,0 +1,734 @@
+diff --git a/cmd/builder/builder_options.go b/cmd/builder/builder_options.go
+index cc0c1f0..e649abf 100644
+--- a/cmd/builder/builder_options.go
++++ b/cmd/builder/builder_options.go
+@@ -19,6 +19,7 @@ import (
+ 	"go.uber.org/zap"
+ 
+ 	cascfg "github.com/jaegertracing/jaeger/pkg/cassandra/config"
++	ddbcfg "github.com/jaegertracing/jaeger/pkg/dynamodb/config"
+ 	escfg "github.com/jaegertracing/jaeger/pkg/es/config"
+ 	"github.com/jaegertracing/jaeger/storage/spanstore/memory"
+ )
+@@ -33,6 +34,8 @@ type BasicOptions struct {
+ 	MemoryStore *memory.Store
+ 	// CassandraSessionBuilder is the cassandra session builder
+ 	CassandraSessionBuilder cascfg.SessionBuilder
++	// DynamodbSessionBuilder is the Dynamodb session builder
++	DynamodbClientBuilder ddbcfg.ClientBuilder
+ 	// ElasticClientBuilder is the elasticsearch client builder
+ 	ElasticClientBuilder escfg.ClientBuilder
+ }
+@@ -64,6 +67,13 @@ func (BasicOptions) CassandraSessionOption(sessionBuilder cascfg.SessionBuilder)
+ 	}
+ }
+ 
++// DynamodbClientOption creates an Option that adds Dynamodb session builder.
++func (BasicOptions) DynamodbClientOption(clientBuilder ddbcfg.ClientBuilder) Option {
++	return func(b *BasicOptions) {
++		b.DynamodbClientBuilder = clientBuilder
++	}
++}
++
+ // ElasticClientOption creates an Option that adds ElasticSearch client builder.
+ func (BasicOptions) ElasticClientOption(clientBuilder escfg.ClientBuilder) Option {
+ 	return func(b *BasicOptions) {
+diff --git a/cmd/builder/builder_options_test.go b/cmd/builder/builder_options_test.go
+index cf23c54..b2862e7 100644
+--- a/cmd/builder/builder_options_test.go
++++ b/cmd/builder/builder_options_test.go
+@@ -21,6 +21,7 @@ import (
+ 	"go.uber.org/zap"
+ 
+ 	cascfg "github.com/jaegertracing/jaeger/pkg/cassandra/config"
++	ddbcfg "github.com/jaegertracing/jaeger/pkg/dynamodb/config"
+ 	escfg "github.com/jaegertracing/jaeger/pkg/es/config"
+ 	"github.com/jaegertracing/jaeger/storage/spanstore/memory"
+ 	"github.com/uber/jaeger-lib/metrics"
+@@ -29,6 +30,10 @@ import (
+ func TestApplyOptions(t *testing.T) {
+ 	opts := ApplyOptions(
+ 		Options.CassandraSessionOption(&cascfg.Configuration{}),
++		Options.DynamodbClientOption(&ddbcfg.Configuration{
++			Region:   "local",
++			Endpoint: "http://localhost:8000",
++		}),
+ 		Options.LoggerOption(zap.NewNop()),
+ 		Options.MetricsFactoryOption(metrics.NullFactory),
+ 		Options.MemoryStoreOption(memory.NewStore()),
+diff --git a/cmd/collector/app/builder/span_handler_builder.go b/cmd/collector/app/builder/span_handler_builder.go
+index 61a7539..ef959a3 100644
+--- a/cmd/collector/app/builder/span_handler_builder.go
++++ b/cmd/collector/app/builder/span_handler_builder.go
+@@ -27,8 +27,10 @@ import (
+ 	"github.com/jaegertracing/jaeger/cmd/flags"
+ 	"github.com/jaegertracing/jaeger/model"
+ 	cascfg "github.com/jaegertracing/jaeger/pkg/cassandra/config"
++	ddbcfg "github.com/jaegertracing/jaeger/pkg/dynamodb/config"
+ 	escfg "github.com/jaegertracing/jaeger/pkg/es/config"
+ 	casSpanstore "github.com/jaegertracing/jaeger/plugin/storage/cassandra/spanstore"
++	ddbSpanstore "github.com/jaegertracing/jaeger/plugin/storage/dynamodb/spanstore"
+ 	esSpanstore "github.com/jaegertracing/jaeger/plugin/storage/es/spanstore"
+ 	"github.com/jaegertracing/jaeger/storage/spanstore"
+ )
+@@ -37,6 +39,7 @@ var (
+ 	errMissingCassandraConfig     = errors.New("Cassandra not configured")
+ 	errMissingMemoryStore         = errors.New("MemoryStore is not provided")
+ 	errMissingElasticSearchConfig = errors.New("ElasticSearch not configured")
++	errMiddingDynamodbConfig      = errors.New("Dynamodb not configured")
+ )
+ 
+ // SpanHandlerBuilder holds configuration required for handlers
+@@ -63,6 +66,11 @@ func NewSpanHandlerBuilder(cOpts *CollectorOptions, sFlags *flags.SharedFlags, o
+ 			return nil, errMissingCassandraConfig
+ 		}
+ 		spanHb.spanWriter, err = spanHb.initCassStore(options.CassandraSessionBuilder)
++	} else if sFlags.SpanStorage.Type == flags.DynamodbStorageType {
++		if options.DynamodbClientBuilder == nil {
++			return nil, errMiddingDynamodbConfig
++		}
++		spanHb.spanWriter, err = spanHb.initDynamodbStore(options.DynamodbClientBuilder)
+ 	} else if sFlags.SpanStorage.Type == flags.MemoryStorageType {
+ 		if options.MemoryStore == nil {
+ 			return nil, errMissingMemoryStore
+@@ -98,6 +106,15 @@ func (spanHb *SpanHandlerBuilder) initCassStore(builder cascfg.SessionBuilder) (
+ 	), nil
+ }
+ 
++func (spanHb *SpanHandlerBuilder) initDynamodbStore(ddbBuilder ddbcfg.ClientBuilder) (spanstore.Writer, error) {
++	client, _ := ddbBuilder.NewDBClient()
++	return ddbSpanstore.NewSpanWriter(
++		client,
++		spanHb.logger,
++		//TODO spanHb.metricsFactory,
++	), nil
++}
++
+ func (spanHb *SpanHandlerBuilder) initElasticStore(esBuilder escfg.ClientBuilder) (spanstore.Writer, error) {
+ 	client, err := esBuilder.NewClient()
+ 	if err != nil {
+diff --git a/cmd/collector/main.go b/cmd/collector/main.go
+index 5776a9c..295fa80 100644
+--- a/cmd/collector/main.go
++++ b/cmd/collector/main.go
+@@ -26,7 +26,7 @@ import (
+ 	"github.com/gorilla/mux"
+ 	"github.com/spf13/cobra"
+ 	"github.com/spf13/viper"
+-	"github.com/uber/tchannel-go"
++	tchannel "github.com/uber/tchannel-go"
+ 	"github.com/uber/tchannel-go/thrift"
+ 	"go.uber.org/zap"
+ 
+@@ -36,6 +36,7 @@ import (
+ 	"github.com/jaegertracing/jaeger/cmd/collector/app/zipkin"
+ 	"github.com/jaegertracing/jaeger/cmd/flags"
+ 	casFlags "github.com/jaegertracing/jaeger/cmd/flags/cassandra"
++	ddbFlags "github.com/jaegertracing/jaeger/cmd/flags/dynamodb"
+ 	esFlags "github.com/jaegertracing/jaeger/cmd/flags/es"
+ 	"github.com/jaegertracing/jaeger/pkg/config"
+ 	"github.com/jaegertracing/jaeger/pkg/healthcheck"
+@@ -53,6 +54,7 @@ func main() {
+ 	serviceName := "jaeger-collector"
+ 	casOptions := casFlags.NewOptions("cassandra")
+ 	esOptions := esFlags.NewOptions("es")
++	ddbOptions := ddbFlags.NewOptions("dynamodb")
+ 
+ 	v := viper.New()
+ 	command := &cobra.Command{
+@@ -73,6 +75,7 @@ func main() {
+ 			}
+ 
+ 			casOptions.InitFromViper(v)
++			ddbOptions.InitFromViper(v)
+ 			esOptions.InitFromViper(v)
+ 			mBldr := new(pMetrics.Builder).InitFromViper(v)
+ 			builderOpts := new(builder.CollectorOptions).InitFromViper(v)
+@@ -93,6 +96,7 @@ func main() {
+ 				builderOpts,
+ 				sFlags,
+ 				basicB.Options.CassandraSessionOption(casOptions.GetPrimary()),
++				basicB.Options.DynamodbClientOption(ddbOptions.GetPrimary()),
+ 				basicB.Options.ElasticClientOption(esOptions.GetPrimary()),
+ 				basicB.Options.LoggerOption(logger),
+ 				basicB.Options.MetricsFactoryOption(metricsFactory),
+@@ -156,6 +160,7 @@ func main() {
+ 		flags.AddFlags,
+ 		builder.AddFlags,
+ 		casOptions.AddFlags,
++		ddbOptions.AddFlags,
+ 		esOptions.AddFlags,
+ 		pMetrics.AddFlags,
+ 	)
+diff --git a/cmd/flags/dynamodb/options.go b/cmd/flags/dynamodb/options.go
+new file mode 100644
+index 0000000..cd1101b
+--- /dev/null
++++ b/cmd/flags/dynamodb/options.go
+@@ -0,0 +1,98 @@
++package dynamodb
++
++import (
++	"flag"
++
++	"github.com/spf13/viper"
++
++	"github.com/jaegertracing/jaeger/pkg/dynamodb/config"
++)
++
++// Options contains various type of Dynamodb configs and provides the ability
++// to bind them to command line flag and apply overlays, so that some configurations
++// (e.g. archive) may be underspecified and infer the rest of its parameters from primary.
++type Options struct {
++	primary *namespaceConfig
++
++	others map[string]*namespaceConfig
++}
++
++// the Servers field in config.Configuration is a list, which we cannot represent with flags.
++// This struct adds a plain string field that can be bound to flags and is then parsed when
++// preparing the actual config.Configuration.
++type namespaceConfig struct {
++	config.Configuration
++	namespace string
++}
++
++// NewOptions creates a new Options struct.
++func NewOptions(primaryNamespace string, otherNamespaces ...string) *Options {
++	// TODO all default values should be defined via cobra flags
++	options := &Options{
++		primary: &namespaceConfig{
++			Configuration: config.Configuration{
++				Region:   "us-west-1",
++				Endpoint: "http://localhost:8000",
++			},
++			namespace: primaryNamespace,
++		},
++		others: make(map[string]*namespaceConfig, len(otherNamespaces)),
++	}
++
++	for _, namespace := range otherNamespaces {
++		options.others[namespace] = &namespaceConfig{namespace: namespace}
++	}
++
++	return options
++}
++
++// AddFlags adds flags for Options
++func (opt *Options) AddFlags(flagSet *flag.FlagSet) {
++	addFlags(flagSet, opt.primary)
++	for _, cfg := range opt.others {
++		addFlags(flagSet, cfg)
++	}
++}
++
++func addFlags(flagSet *flag.FlagSet, nsConfig *namespaceConfig) {
++	flagSet.String(
++		nsConfig.namespace+".region",
++		nsConfig.Region,
++		"The AWS region",
++	)
++	flagSet.String(
++		nsConfig.namespace+".endpoint",
++		nsConfig.Endpoint,
++		"The Dynamodb endpoint (eg: dynamodb.us-west-1.amazonaws.com)",
++	)
++}
++
++// InitFromViper initializes Options with properties from viper
++func (opt *Options) InitFromViper(v *viper.Viper) {
++	initFromViper(opt.primary, v)
++	for _, cfg := range opt.others {
++		initFromViper(cfg, v)
++	}
++}
++
++func initFromViper(cfg *namespaceConfig, v *viper.Viper) {
++	cfg.Endpoint = v.GetString(cfg.namespace + ".endpoint")
++	cfg.Region = v.GetString(cfg.namespace + ".region")
++}
++
++// GetPrimary returns primary configuration.
++func (opt *Options) GetPrimary() *config.Configuration {
++	return &opt.primary.Configuration
++}
++
++// Get returns auxiliary named configuration.
++func (opt *Options) Get(namespace string) *config.Configuration {
++	nsCfg, ok := opt.others[namespace]
++	if !ok {
++		nsCfg = &namespaceConfig{}
++		opt.others[namespace] = nsCfg
++	}
++	nsCfg.Configuration.ApplyDefaults(&opt.primary.Configuration)
++
++	return &nsCfg.Configuration
++}
+diff --git a/cmd/flags/flags.go b/cmd/flags/flags.go
+index f17cd13..b2b6ccf 100644
+--- a/cmd/flags/flags.go
++++ b/cmd/flags/flags.go
+@@ -28,10 +28,13 @@ import (
+ const (
+ 	// CassandraStorageType is the storage type flag denoting a Cassandra backing store
+ 	CassandraStorageType = "cassandra"
++	// DynamodbStorageType is the storage type flag denoting a Dynamodb backing store
++	DynamodbStorageType = "dynamodb"
+ 	// MemoryStorageType is the storage type flag denoting an in-memory store
+ 	MemoryStorageType = "memory"
+ 	// ESStorageType is the storage type flag denoting an ElasticSearch backing store
+-	ESStorageType                  = "elasticsearch"
++	ESStorageType = "elasticsearch"
++
+ 	spanStorageType                = "span-storage.type"
+ 	logLevel                       = "log-level"
+ 	dependencyStorageDataFrequency = "dependency-storage.data-frequency"
+diff --git a/cmd/query/main.go b/cmd/query/main.go
+index 4587460..b7b6831 100644
+--- a/cmd/query/main.go
++++ b/cmd/query/main.go
+@@ -32,6 +32,7 @@ import (
+ 	basicB "github.com/jaegertracing/jaeger/cmd/builder"
+ 	"github.com/jaegertracing/jaeger/cmd/flags"
+ 	casFlags "github.com/jaegertracing/jaeger/cmd/flags/cassandra"
++	ddbFlags "github.com/jaegertracing/jaeger/cmd/flags/dynamodb"
+ 	esFlags "github.com/jaegertracing/jaeger/cmd/flags/es"
+ 	"github.com/jaegertracing/jaeger/cmd/query/app"
+ 	"github.com/jaegertracing/jaeger/cmd/query/app/builder"
+@@ -47,6 +48,7 @@ func main() {
+ 	signal.Notify(serverChannel, os.Interrupt, syscall.SIGTERM)
+ 
+ 	casOptions := casFlags.NewOptions("cassandra", "cassandra.archive")
++	ddbOptions := ddbFlags.NewOptions("dynamodb", "dynamodb.archive")
+ 	esOptions := esFlags.NewOptions("es", "es.archive")
+ 	v := viper.New()
+ 
+@@ -67,6 +69,7 @@ func main() {
+ 			}
+ 
+ 			casOptions.InitFromViper(v)
++			ddbOptions.InitFromViper(v)
+ 			esOptions.InitFromViper(v)
+ 			queryOpts := new(builder.QueryOptions).InitFromViper(v)
+ 			mBldr := new(pMetrics.Builder).InitFromViper(v)
+@@ -101,6 +104,7 @@ func main() {
+ 				basicB.Options.LoggerOption(logger),
+ 				basicB.Options.MetricsFactoryOption(metricsFactory),
+ 				basicB.Options.CassandraSessionOption(casOptions.GetPrimary()),
++				basicB.Options.DynamodbClientOption(ddbOptions.GetPrimary()),
+ 				basicB.Options.ElasticClientOption(esOptions.GetPrimary()),
+ 			)
+ 			if err != nil {
+@@ -152,6 +156,7 @@ func main() {
+ 		flags.AddConfigFileFlag,
+ 		flags.AddFlags,
+ 		casOptions.AddFlags,
++		ddbOptions.AddFlags,
+ 		esOptions.AddFlags,
+ 		pMetrics.AddFlags,
+ 		builder.AddFlags,
+diff --git a/glide.lock b/glide.lock
+index 678a29f..2f8137a 100644
+--- a/glide.lock
++++ b/glide.lock
+@@ -1,5 +1,5 @@
+-hash: c152996d24dff5978cbfe5aa65739995f12f824e62510b5b66372c7d2e7e6f18
+-updated: 2017-11-27T15:48:19.270604282-05:00
++hash: 1f26c0aaf6dd984da0a38d4a3159485f25f5be8f51ba01c41817c3529d2dc3d7
++updated: 2018-01-04T19:31:19.972045541-05:00
+ imports:
+ - name: github.com/apache/thrift
+   version: 53dd39833a08ce33582e5ff31fa18bb4735d6731
+@@ -7,10 +7,43 @@ imports:
+   - lib/go/thrift
+ - name: github.com/asaskevich/govalidator
+   version: 808e7b820405fbd763f8a3c95531df8f87e675f1
++- name: github.com/aws/aws-sdk-go
++  version: f62f7b7c5425f2b1a630932617477bdeac6dc371
++  subpackages:
++  - aws
++  - aws/awserr
++  - aws/awsutil
++  - aws/client
++  - aws/client/metadata
++  - aws/corehandlers
++  - aws/credentials
++  - aws/credentials/ec2rolecreds
++  - aws/credentials/endpointcreds
++  - aws/credentials/stscreds
++  - aws/defaults
++  - aws/ec2metadata
++  - aws/endpoints
++  - aws/request
++  - aws/session
++  - aws/signer/v4
++  - internal/shareddefaults
++  - private/protocol
++  - private/protocol/json/jsonutil
++  - private/protocol/jsonrpc
++  - private/protocol/query
++  - private/protocol/query/queryutil
++  - private/protocol/rest
++  - private/protocol/xml/xmlutil
++  - service/dynamodb
++  - service/dynamodb/dynamodbattribute
++  - service/dynamodb/dynamodbiface
++  - service/sts
+ - name: github.com/beorn7/perks
+   version: 4c0e84591b9aa9e6dcfdf3e020114cd81f89d5f9
+   subpackages:
+   - quantile
++- name: github.com/cenkalti/backoff
++  version: 61153c768f31ee5f130071d08fc82b85208528de
+ - name: github.com/codahale/hdrhistogram
+   version: f8ad88b59a584afeee9d334eff879b104439117b
+ - name: github.com/crossdock/crossdock-go
+@@ -24,6 +57,8 @@ imports:
+   - spew
+ - name: github.com/fsnotify/fsnotify
+   version: 30411dbcefb7a1da7e84f75530ad3abe4011b4f8
++- name: github.com/go-ini/ini
++  version: 32e4c1e6bc4e7d0d8451aa6b75200d19e37a536a
+ - name: github.com/go-kit/kit
+   version: a9ca6725cbbea455e61c6bc8a1ed28e81eb3493b
+   subpackages:
+@@ -75,6 +110,10 @@ imports:
+   version: 3a5767ca75ece5f7f1440b1d16975247f8d8b221
+ - name: github.com/gorilla/mux
+   version: 392c28fe23e1c45ddba891b0320b3b5df220beea
++- name: github.com/guregu/dynamo
++  version: 78f36f7876767b1899b4bac7381d109fe5a58539
++  subpackages:
++  - internal/exprs
+ - name: github.com/hailocab/go-hostpool
+   version: e80d13ce29ede4452c43dea11e79b9bc8a15b478
+ - name: github.com/hashicorp/hcl
+@@ -90,6 +129,8 @@ imports:
+   - json/token
+ - name: github.com/inconshreveable/mousetrap
+   version: 76626ae9c91c4f2a10f34cad8ce83ea42c93bb75
++- name: github.com/jmespath/go-jmespath
++  version: dd801d4f4ce7ac746e7e7b4489d2fa600b3b096b
+ - name: github.com/kr/pretty
+   version: cfb55aafdaf3ec08f0db22699ab822c50091b1c4
+ - name: github.com/magiconair/properties
+@@ -175,7 +216,7 @@ imports:
+ - name: github.com/uber-go/atomic
+   version: 8474b86a5a6f79c443ce4b2992817ff32cf208b8
+ - name: github.com/uber/jaeger-client-go
+-  version: ff3efa227b65e419701a4f48985379ca106a89e7
++  version: f54d8ece0a66e3db6a9247e946eb1e2bd79029ea
+   subpackages:
+   - config
+   - internal/baggage
+@@ -228,7 +269,7 @@ imports:
+   - zapcore
+   - zaptest
+ - name: golang.org/x/net
+-  version: a337091b0525af65de94df2eb7e98bd9962dcbe2
++  version: d866cfc389cec985d6fda2859936a575a55a3ab6
+   subpackages:
+   - context
+   - context/ctxhttp
+diff --git a/glide.yaml b/glide.yaml
+index 4d97647..6138656 100644
+--- a/glide.yaml
++++ b/glide.yaml
+@@ -53,3 +53,8 @@ import:
+ - package: github.com/go-openapi/swag
+ - package: github.com/go-openapi/validate
+ - package: github.com/go-openapi/loads
++- package: github.com/guregu/dynamo
++- package: github.com/aws/aws-sdk-go
++  version: ^1.12.55
++- package: github.com/cenkalti/backoff
++  version: ~1.1.0
+diff --git a/pkg/dynamodb/client.go b/pkg/dynamodb/client.go
+new file mode 100644
+index 0000000..489e7b9
+--- /dev/null
++++ b/pkg/dynamodb/client.go
+@@ -0,0 +1,8 @@
++package dynamodb
++
++// Client is an abstraction of a Dynamodb Client
++type Client interface {
++	// Create table
++	// List tables
++	//
++}
+diff --git a/pkg/dynamodb/config/config.go b/pkg/dynamodb/config/config.go
+new file mode 100644
+index 0000000..cee9500
+--- /dev/null
++++ b/pkg/dynamodb/config/config.go
+@@ -0,0 +1,34 @@
++package config
++
++import (
++	"github.com/aws/aws-sdk-go/aws"
++	"github.com/aws/aws-sdk-go/aws/session"
++	"github.com/guregu/dynamo"
++)
++
++// Configuration describes the configuration properties needed to connect to a Cassandra cluster
++type Configuration struct {
++	Region   string `validate:"nonzero"`
++	Endpoint string `validate:"nonzero"`
++}
++
++// ApplyDefaults copies settings from source unless its own value is non-zero.
++func (c *Configuration) ApplyDefaults(source *Configuration) {
++
++}
++
++// ClientBuilder creates new Dynamo DB instance
++type ClientBuilder interface {
++	NewDBClient() (*dynamo.DB, error)
++}
++
++// NewDBClient creates a new Dynamo DB instance
++func (c *Configuration) NewDBClient() (*dynamo.DB, error) {
++
++	awsConf := aws.NewConfig()
++	awsConf.WithRegion(c.Region).WithEndpoint(c.Endpoint)
++
++	db := dynamo.New(session.New(), awsConf)
++
++	return db, nil
++}
+diff --git a/pkg/dynamodb/mocks/Client.go b/pkg/dynamodb/mocks/Client.go
+new file mode 100644
+index 0000000..799863b
+--- /dev/null
++++ b/pkg/dynamodb/mocks/Client.go
+@@ -0,0 +1,8 @@
++package mocks
++
++import mock "github.com/stretchr/testify/mock"
++
++// Client is an autogenerated mock type for the Client type
++type Client struct {
++	mock.Mock
++}
+diff --git a/plugin/storage/dynamodb/README.md b/plugin/storage/dynamodb/README.md
+new file mode 100644
+index 0000000..c258675
+--- /dev/null
++++ b/plugin/storage/dynamodb/README.md
+@@ -0,0 +1,6 @@
++# Dynamodb Support
++
++## Running Dynamodb locally
++
++- Make sure you have Java installed on your development machine.
++- Download / install Dynamodb following the [documentations](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html) steps.
+diff --git a/plugin/storage/dynamodb/operation_names.go b/plugin/storage/dynamodb/operation_names.go
+new file mode 100644
+index 0000000..7e133e6
+--- /dev/null
++++ b/plugin/storage/dynamodb/operation_names.go
+@@ -0,0 +1,24 @@
++package dynamodb
++
++import (
++	"time"
++
++	"go.uber.org/zap"
++
++	"github.com/jaegertracing/jaeger/pkg/cache"
++	"github.com/jaegertracing/jaeger/pkg/dynamodb"
++)
++
++// OperationNamesStorage stores known operation names by service.
++type OperationNamesStorage struct {
++	client         dynamodb.Client
++	writeCacheTTL  time.Duration
++	operationNames cache.Cache
++	logger         *zap.Logger
++}
++
++// NewOperationNamesStorage returns a new OperationNamesStorage
++
++// Write saves Operation and Service name tuples
++
++// GetOperations returns all operations for a specific service traced by Jaeger
+diff --git a/plugin/storage/dynamodb/spanstore/reader.go b/plugin/storage/dynamodb/spanstore/reader.go
+new file mode 100644
+index 0000000..a307160
+--- /dev/null
++++ b/plugin/storage/dynamodb/spanstore/reader.go
+@@ -0,0 +1 @@
++package spanstore
+diff --git a/plugin/storage/dynamodb/spanstore/service_names.go b/plugin/storage/dynamodb/spanstore/service_names.go
+new file mode 100644
+index 0000000..9a0a39d
+--- /dev/null
++++ b/plugin/storage/dynamodb/spanstore/service_names.go
+@@ -0,0 +1,40 @@
++package spanstore
++
++import (
++	"time"
++
++	"go.uber.org/zap"
++
++	"github.com/jaegertracing/jaeger/pkg/cache"
++	"github.com/jaegertracing/jaeger/pkg/dynamodb"
++)
++
++// ServiceNamesStorage stores known service names.
++type ServiceNamesStorage struct {
++	client         dynamodb.Client
++	writeCacheTTL  time.Duration
++	operationNames cache.Cache
++	logger         *zap.Logger
++	// Insert
++	// Query
++	// serviceNames
++}
++
++// Write saves a single service name
++func (s *ServiceNamesStorage) Write(serviceName string) error {
++	var err error
++	// Insert service name if not exists (also check if it's in cache)
++
++	return err
++}
++
++// GetServices returns all services traced by Jaeger
++func (s *ServiceNamesStorage) GetServices() ([]string, error) {
++
++	//var service string
++	var services []string
++
++	// Iterate over services and append to services.
++
++	return services, nil
++}
+diff --git a/plugin/storage/dynamodb/spanstore/writer.go b/plugin/storage/dynamodb/spanstore/writer.go
+new file mode 100644
+index 0000000..b63476c
+--- /dev/null
++++ b/plugin/storage/dynamodb/spanstore/writer.go
+@@ -0,0 +1,34 @@
++package spanstore
++
++import (
++	"go.uber.org/zap"
++
++	"github.com/guregu/dynamo"
++	"github.com/jaegertracing/jaeger/model"
++)
++
++// SpanWriter handles all writes to Dynamodb for the Jaeger data model
++type SpanWriter struct {
++	client *dynamo.DB
++	logger *zap.Logger
++}
++
++// NewSpanWriter returns a SpanWriter
++func NewSpanWriter(
++	client *dynamo.DB,
++	logger *zap.Logger,
++	// TODO options ...Option,
++) *SpanWriter {
++	// TODO opts := applyOptions(options...)
++	return &SpanWriter{
++		client: client,
++		logger: logger,
++	}
++}
++
++// WriteSpan saves the span into Dynamodb
++func (s *SpanWriter) WriteSpan(span *model.Span) error {
++	println(span)
++	// TODO do something with span
++	return nil
++}
+diff --git a/plugin/storage/dynamodb/spanstore/writer_test.go b/plugin/storage/dynamodb/spanstore/writer_test.go
+new file mode 100644
+index 0000000..8516fd3
+--- /dev/null
++++ b/plugin/storage/dynamodb/spanstore/writer_test.go
+@@ -0,0 +1,25 @@
++package spanstore
++
++import (
++	"testing"
++
++	"github.com/jaegertracing/jaeger/storage/spanstore"
++)
++
++var _ spanstore.Writer = &SpanWriter{} // check API conformance
++
++func TestSpanWriter(t *testing.T) {
++	testCases := []struct {
++		caption string
++	}{
++		{
++			caption: "main query",
++		},
++	}
++	for _, tc := range testCases {
++		testCase := tc
++		t.Run(testCase.caption, func(t *testing.T) {
++			println("hello")
++		})
++	}
++}
+diff --git a/plugin/storage/dynamodb/terraform/config.tf b/plugin/storage/dynamodb/terraform/config.tf
+new file mode 100644
+index 0000000..6f89962
+--- /dev/null
++++ b/plugin/storage/dynamodb/terraform/config.tf
+@@ -0,0 +1,6 @@
++provider "aws" {
++    access_key = "xxx"
++    secret_key = "xxx"
++    region = "us-east-1"
++    dynamodb_endpoint = "http://localhost:8000"
++}
+\ No newline at end of file
+diff --git a/plugin/storage/dynamodb/terraform/main.tf b/plugin/storage/dynamodb/terraform/main.tf
+new file mode 100644
+index 0000000..1b6f022
+--- /dev/null
++++ b/plugin/storage/dynamodb/terraform/main.tf
+@@ -0,0 +1,35 @@
++resource "aws_dynamodb_table" "items_table" {
++  name           = "spanstore_test"
++  read_capacity  = "10"
++  write_capacity = "10"
++  hash_key       = "id"
++
++  attribute {
++    name = "id"
++    type = "S"
++  }
++
++  attribute {
++    name = "platform.xid"
++    type = "S"
++  }
++
++  attribute {
++    name = "xtype"
++    type = "S"
++  }
++
++  global_secondary_index {
++    name            = "platform.xid-index"
++    hash_key        = "platform.xid"
++    range_key       = "xtype"
++    read_capacity   = "10"
++    write_capacity  = "$10"
++    projection_type = "KEYS_ONLY"
++  }
++
++  # Ignored due to autoscaling
++  lifecycle {
++    ignore_changes = ["read_capacity", "write_capacity"]
++  }
++}
+\ No newline at end of file

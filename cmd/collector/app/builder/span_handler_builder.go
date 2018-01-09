@@ -30,6 +30,7 @@ import (
 
 var (
 	errMissingCassandraConfig     = errors.New("Cassandra not configured")
+	errMissingDynamodbConfig      = errors.New("Dynamodb is not configured")
 	errMissingMemoryStore         = errors.New("MemoryStore is not provided")
 	errMissingElasticSearchConfig = errors.New("ElasticSearch not configured")
 )

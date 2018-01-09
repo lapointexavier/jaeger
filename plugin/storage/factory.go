@@ -24,6 +24,7 @@ import (
 
 	"github.com/jaegertracing/jaeger/plugin"
 	"github.com/jaegertracing/jaeger/plugin/storage/cassandra"
+	"github.com/jaegertracing/jaeger/plugin/storage/dynamodb"
 	"github.com/jaegertracing/jaeger/plugin/storage/es"
 	"github.com/jaegertracing/jaeger/plugin/storage/memory"
 	"github.com/jaegertracing/jaeger/storage"
@@ -33,6 +34,7 @@ import (
 
 const (
 	cassandraStorageType     = "cassandra"
+	dynamodbStorageType      = "dynamodb"
 	elasticsearchStorageType = "elasticsearch"
 	memoryStorageType        = "memory"
 )
@@ -68,6 +70,8 @@ func (f *Factory) getFactoryOfType(factoryType string) (storage.Factory, error) 
 	switch factoryType {
 	case cassandraStorageType:
 		return cassandra.NewFactory(), nil
+	case dynamodbStorageType:
+		return dynamodb.NewFactory(), nil
 	case elasticsearchStorageType:
 		return es.NewFactory(), nil
 	case memoryStorageType:
